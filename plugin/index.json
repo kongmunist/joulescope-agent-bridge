@@ -1,0 +1,8 @@
+{
+  "id": "joulescope_ui.plugins.agent_bridge",
+  "version": "0.1.0",
+  "name": "Agent Bridge",
+  "description": "Exposes a JS220's voltage/current/power statistics and target-power toggle on a localhost JSON-line socket so external scripts and AI agents can monitor and control the device while the UI keeps it open.",
+  "author": "andykong.org",
+  "license": "MIT"
+}
