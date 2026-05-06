@@ -23,30 +23,51 @@ the existing claim — it subscribes to the UI's PubSub bus for live stats and
 publishes settings to control the rail. It then exposes those primitives over
 a localhost socket so any external process can drive them.
 
+## Install
+
+### Plugin (required for the bridge backend)
+
+Symlink (or copy) `plugin/` into the UI's plugin directory:
+
+```sh
+# macOS
+ln -s "$PWD/plugin" "$HOME/Library/Application Support/joulescope/plugins/agent_bridge"
+# Linux
+ln -s "$PWD/plugin" "$HOME/.config/joulescope/plugins/agent_bridge"
+# Windows (PowerShell)
+New-Item -ItemType SymbolicLink `
+  -Path  "$env:APPDATA\joulescope\plugins\agent_bridge" `
+  -Value "$PWD\plugin"
+```
+
+Then restart the Joulescope UI, **File → Plugins** → enable **Agent Bridge**,
+and drop the **Agent Bridge** widget into your layout.
+
+### Client (Python)
+
+The client is a single file (`agent_client.py`) — copy it next to your script
+or `pip install` it from this checkout:
+
+```sh
+pip install joulescope          # only required for the direct fallback
+```
+
+`joulescope` is **only** needed when the UI/plugin isn't running. If you only
+ever use the bridge backend, you can skip the pip install entirely — the
+client uses stdlib sockets for that path.
+
 ## Quickstart
 
-1. Symlink the plugin into the UI's plugin directory:
-
-   ```sh
-   # macOS
-   ln -s "$PWD/plugin" "$HOME/Library/Application Support/joulescope/plugins/agent_bridge"
-   # Linux
-   ln -s "$PWD/plugin" "$HOME/.config/joulescope/plugins/agent_bridge"
-   ```
-
-2. Restart the Joulescope UI. **File → Plugins** → enable **Agent Bridge**.
-3. **Widgets → Agent Bridge** — drop the widget anywhere; it auto-attaches to
-   the first JS220 and starts a JSON-line socket on `127.0.0.1:9876`.
-4. Connect your JS220 in the UI as normal.
-5. From any terminal:
+1. Install the plugin (above) and connect your JS220 in the UI.
+2. From any terminal:
    ```sh
    python agent_client.py            # prints device id, V, I, P, 1 s avg
    python agent_client.py off        # cuts the rail
    python agent_client.py on         # restores it
    ```
 
-The plugin's own [README](plugin/README.md) has the install paths for every
-OS and the full wire protocol.
+The plugin's own [README](plugin/README.md) has all install paths and the
+full wire protocol.
 
 ## For AI agents / automation
 
@@ -56,8 +77,9 @@ Python, this is the contract. The client transparently uses two backends:
 - **Bridge backend** (preferred): talks to the UI plugin's localhost socket.
   Works while the human keeps the Joulescope UI open — no USB contention.
 - **Direct backend** (fallback): when the UI/plugin isn't running, the
-  client opens the JS220 itself via the `joulescope` package
-  (`pip install joulescope`).
+  client opens the JS220 itself via the `joulescope` package. Install it
+  with `pip install joulescope` — this is only needed if you expect to run
+  without the UI.
 
 The client tries the bridge first on every call, falls back to direct on
 `ConnectionRefusedError`, and **self-recovers**: a watcher thread polls the
