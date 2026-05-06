@@ -6,11 +6,17 @@ rail **while the Joulescope UI keeps the device open**. No USB contention.
 
 ```
 joulescope-agent-bridge/
-├── plugin/              ← copy or symlink into the UI's plugin path
-│   ├── __init__.py      ← runs inside the UI; PubSub bridge + JSON-line socket
+├── plugin/                       ← copy or symlink into the UI's plugin path
+│   ├── __init__.py               ← runs inside the UI; PubSub + JSON-line socket
 │   ├── index.json
-│   └── README.md        ← install steps, wire protocol, caveats
-└── agent_client.py      ← thin Python client for the socket
+│   └── README.md                 ← install steps, wire protocol, caveats
+├── joulescope_agent_bridge/      ← pip-installable Python client
+│   ├── __init__.py
+│   └── __main__.py
+├── agent_client.py               ← backwards-compat shim
+├── pyproject.toml
+├── LICENSE
+└── README.md
 ```
 
 ## Why a plugin
@@ -45,26 +51,33 @@ and drop the **Agent Bridge** widget into your layout.
 
 ### Client (Python)
 
-The client is a single file (`agent_client.py`) — copy it next to your script
-or `pip install` it from this checkout:
-
 ```sh
-pip install pyjoulescope_driver        # only required for the direct fallback
+# bridge mode only (no extra deps; just stdlib sockets)
+pip install joulescope-agent-bridge
+
+# with direct-USB fallback for when the UI is closed
+pip install joulescope-agent-bridge[direct]
 ```
 
-`pyjoulescope_driver` is **only** needed when the UI/plugin isn't running. If
-you only ever use the bridge backend, you can skip the pip install entirely —
-the client uses stdlib sockets for that path. (On Homebrew Python you may
-need `pip install --break-system-packages` or `--user`.)
+The `[direct]` extra pulls in `pyjoulescope_driver` for the no-UI path. On
+Homebrew Python you may need `--break-system-packages` or `--user`. Until
+this is on PyPI, install from the checkout: `pip install -e .[direct]`.
+
+After install you get:
+
+- `import joulescope_agent_bridge as jab` — Python API
+- `joulescope-bridge` — CLI command
+- `python -m joulescope_agent_bridge` — equivalent to the CLI
+- `agent_client.py` — backwards-compat shim still works (`python agent_client.py`)
 
 ## Quickstart
 
 1. Install the plugin (above) and connect your JS220 in the UI.
 2. From any terminal:
    ```sh
-   python agent_client.py            # prints device id, V, I, P, 1 s avg
-   python agent_client.py off        # cuts the rail
-   python agent_client.py on         # restores it
+   joulescope-bridge            # prints device id, V, I, P, 1 s avg
+   joulescope-bridge off        # cuts the rail
+   joulescope-bridge on         # restores it
    ```
 
 The plugin's own [README](plugin/README.md) has all install paths and the
@@ -99,7 +112,7 @@ as the UI comes back so the human's UI can attach to the device again.
 ### Python API (preferred)
 
 ```python
-from agent_client import (
+from joulescope_agent_bridge import (
     device, read_voltage, read_current, read_power, avg_1s, set_power,
     BridgeError,
 )
@@ -168,7 +181,7 @@ Full table of commands in [`plugin/README.md`](plugin/README.md).
 
 ```python
 import time
-from agent_client import set_power, avg_1s
+from joulescope_agent_bridge import set_power, avg_1s
 
 set_power(True)
 time.sleep(1.0)               # let DUT boot / settle

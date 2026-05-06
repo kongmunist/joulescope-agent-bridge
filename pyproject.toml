@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "joulescope-agent-bridge"
+version = "0.1.0"
+description = "Localhost JSON-line client + Joulescope UI plugin: read JS220 V/I/P and toggle target power while the UI keeps the device open."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "andykong.org" }]
+keywords = ["joulescope", "js220", "agent", "automation", "energy", "power", "measurement"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering :: Hardware",
+]
+dependencies = []
+
+[project.optional-dependencies]
+direct = ["pyjoulescope_driver"]
+
+[project.scripts]
+joulescope-bridge = "joulescope_agent_bridge:main"
+
+[project.urls]
+Homepage = "https://github.com/kongmunist/joulescope-agent-bridge"
+Issues = "https://github.com/kongmunist/joulescope-agent-bridge/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["joulescope_agent_bridge*"]
+exclude = ["plugin*"]
