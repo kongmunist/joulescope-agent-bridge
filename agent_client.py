@@ -1,10 +1,10 @@
 """Client for the Joulescope Agent Bridge.
 
 Tries the UI plugin's localhost socket first. If the UI isn't running,
-falls back to claiming the JS220 directly via the `joulescope` package
-(install with `pip install joulescope`). Self-recovers: when the UI
-comes back, a watcher thread releases the direct claim so the UI can
-attach again.
+falls back to claiming the JS220 directly via `pyjoulescope_driver`
+(install with `pip install pyjoulescope_driver`). Self-recovers: when
+the UI comes back, a watcher thread releases the direct claim so the
+UI can attach again.
 
 Public API (stable across both backends):
 
@@ -34,10 +34,21 @@ TIMEOUT_S = 2.0
 BRIDGE_PROBE_S = 0.2
 WATCHER_INTERVAL_S = 2.0
 DIRECT_FIRST_SAMPLE_TIMEOUT_S = 3.0
+DIRECT_STATS_HZ = 2.0
 
 
 class BridgeError(RuntimeError):
     """Raised when no backend can satisfy the request."""
+
+
+def _stats_mean(stats: dict, signal: str) -> float | None:
+    """Pull the mean for a signal out of a `s/stats/value` payload."""
+    for key in ("avg", "µ"):
+        try:
+            return float(stats["signals"][signal][key]["value"])
+        except (KeyError, TypeError, ValueError):
+            pass
+    return None
 
 
 # ---------- Bridge backend (UI plugin's socket) --------------------------
@@ -74,40 +85,58 @@ class _Direct:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._dev: Any = None
+        self._driver: Any = None
+        self._path: str | None = None
         self._unique_id: str | None = None
         self._samples: collections.deque[tuple[float, float, float, float]] = collections.deque()
         self._last: tuple[float, float, float, float] | None = None
+        self._closed = True  # gate on late callbacks
         self._stop = threading.Event()
         self._watcher: threading.Thread | None = None
 
     def is_open(self) -> bool:
         with self._lock:
-            return self._dev is not None
+            return self._driver is not None
 
     def open(self) -> None:
         with self._lock:
-            if self._dev is not None:
+            if self._driver is not None:
                 return
             try:
-                from joulescope import scan
+                from pyjoulescope_driver import Driver
             except ImportError as e:
                 raise BridgeError(
-                    "direct fallback needs the 'joulescope' package: pip install joulescope"
+                    "direct fallback needs pyjoulescope_driver: "
+                    "pip install pyjoulescope_driver"
                 ) from e
-            devices = scan(config="off")
-            if not devices:
+            d = Driver()
+            paths = [p for p in d.device_paths() if "/js220/" in p]
+            if not paths:
                 raise BridgeError("no JS220 found and Joulescope UI not running")
-            dev = devices[0]
-            dev.open()
-            dev.parameter_set("v_range", "15V")
-            dev.parameter_set("i_range", "auto")
-            dev.statistics_callback_register(self._on_stats, "sensor")
-            dev.start()
-            self._dev = dev
-            self._unique_id = self._extract_uid(dev)
+            path = paths[0]
+            d.open(path)
+            scnt = max(1, int(1_000_000 / DIRECT_STATS_HZ))
+            try:
+                d.publish(f"{path}/s/stats/scnt", scnt, timeout=0)
+            except Exception:
+                pass
+            try:
+                # Make sure rail is on; "auto" is the default powered state.
+                d.publish(f"{path}/s/i/range/mode", "auto", timeout=0)
+            except Exception:
+                pass
+            d.subscribe(f"{path}/s/stats/value", "pub", self._on_stats)
+            try:
+                # Enable the statistics stream — without this no callbacks fire.
+                d.publish(f"{path}/s/stats/ctrl", 1, timeout=0)
+            except Exception:
+                pass
+            self._driver = d
+            self._path = path
+            self._unique_id = self._extract_uid(path)
             self._samples.clear()
             self._last = None
+            self._closed = False
         self._stop.clear()
         if self._watcher is None or not self._watcher.is_alive():
             self._watcher = threading.Thread(
@@ -119,41 +148,55 @@ class _Direct:
 
     def close(self) -> None:
         self._stop.set()
+        if self._watcher is not None and self._watcher.is_alive():
+            self._watcher.join(timeout=0.5)
         with self._lock:
-            dev = self._dev
-            self._dev = None
+            d = self._driver
+            path = self._path
+            self._closed = True
+            self._driver = None
+            self._path = None
             self._unique_id = None
             self._samples.clear()
             self._last = None
-        if dev is not None:
-            for fn in (dev.stop, dev.close):
-                try:
-                    fn()
-                except Exception:
-                    pass
+        if d is None or path is None:
+            return
+        # Block on the unsubscribe so no late callbacks dispatch into our
+        # half-torn-down state. Then close the device path. We deliberately
+        # don't call d.finalize() — the C jsdrv lives until the process
+        # exits and gets cleaned up by the OS.
+        try:
+            d.publish(f"{path}/s/stats/ctrl", 0, timeout=0)
+        except Exception:
+            pass
+        try:
+            d.unsubscribe(f"{path}/s/stats/value", self._on_stats, timeout=0.5)
+        except Exception:
+            pass
+        try:
+            d.close(path)
+        except Exception:
+            pass
 
     @staticmethod
-    def _extract_uid(dev: Any) -> str:
-        for attr in ("device_serial_number", "serial_number"):
-            v = getattr(dev, attr, None)
-            if v:
-                return f"JS220-{v}"
-        s = str(dev)
-        if "JS220-" in s:
-            tail = s[s.index("JS220-"):]
-            return tail.split()[0].rstrip(">").rstrip(",")
-        return s
+    def _extract_uid(path: str) -> str:
+        # path looks like "u/js220/005633"
+        sn = path.rstrip("/").rsplit("/", 1)[-1]
+        return f"JS220-{sn}"
 
-    def _on_stats(self, stats: dict) -> None:
-        try:
-            sig = stats["signals"]
-            v = float(sig["voltage"]["µ"]["value"])
-            i = float(sig["current"]["µ"]["value"])
-            p = float(sig["power"]["µ"]["value"])
-        except (KeyError, TypeError, ValueError):
+    def _on_stats(self, topic: str, value: Any) -> None:
+        # Defensive: callbacks can fire briefly after close() returns.
+        if self._closed or not isinstance(value, dict):
+            return
+        v = _stats_mean(value, "v") or _stats_mean(value, "voltage")
+        i = _stats_mean(value, "i") or _stats_mean(value, "current")
+        p = _stats_mean(value, "p") or _stats_mean(value, "power")
+        if v is None or i is None or p is None:
             return
         now = time.monotonic()
         with self._lock:
+            if self._closed:
+                return
             self._samples.append((now, v, i, p))
             self._last = (now, v, i, p)
             cutoff = now - 1.0
@@ -209,7 +252,14 @@ class _Direct:
             self.open()
             on = bool(payload["on"])
             with self._lock:
-                self._dev.parameter_set("i_range", "auto" if on else "off")
+                d = self._driver
+                path = self._path
+            if d is None or path is None:
+                return {"ok": False, "error": "device not open"}
+            try:
+                d.publish(f"{path}/s/i/range/mode", "auto" if on else "off", timeout=0)
+            except Exception as e:
+                return {"ok": False, "error": f"publish failed: {e}"}
             return {"ok": True, "target_power": on}
         return {"ok": False, "error": f"unknown cmd: {cmd!r}"}
 
@@ -263,23 +313,41 @@ def set_power(on: bool) -> bool:
     return _request({"cmd": "power_set", "on": bool(on)})["target_power"]
 
 
-if __name__ == "__main__":
+def _cli_main() -> int:
     import sys
 
     if len(sys.argv) < 2:
         backend = "bridge" if _bridge_reachable() else "direct"
+        avg = avg_1s()
         print(f"backend  : {backend}")
         print(f"device   : {device()}")
-        print(f"voltage  : {read_voltage():.4f} V")
-        print(f"current  : {read_current()*1e3:.4f} mA")
-        print(f"power    : {read_power()*1e3:.4f} mW")
-        print(f"avg 1s   : {avg_1s()}")
-        sys.exit(0)
+        print(f"voltage  : {read_voltage():.6f} V")
+        print(f"current  : {read_current()*1e3:.6f} mA")
+        print(f"power    : {read_power()*1e3:.6f} mW")
+        print(f"avg V 1s : {avg['voltage']:.6f} V")
+        print(f"avg I 1s : {avg['current']*1e3:.6f} mA")
+        print(f"avg P 1s : {avg['power']*1e3:.6f} mW")
+        print(f"samples  : {avg['n']}")
+        return 0
     cmd = sys.argv[1]
     if cmd == "on":
         print(set_power(True))
-    elif cmd == "off":
+        return 0
+    if cmd == "off":
         print(set_power(False))
-    else:
-        print(f"usage: {sys.argv[0]} [on|off]", file=sys.stderr)
-        sys.exit(2)
+        return 0
+    print(f"usage: {sys.argv[0]} [on|off]", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    import os
+    import sys
+    rc = _cli_main()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    # Explicit close before interpreter teardown — pyjoulescope_driver's
+    # background thread can segfault during module finalization if the
+    # device handle is still alive. os._exit skips finalization entirely.
+    _direct.close()
+    os._exit(rc)

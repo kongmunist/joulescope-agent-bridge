@@ -49,12 +49,13 @@ The client is a single file (`agent_client.py`) — copy it next to your script
 or `pip install` it from this checkout:
 
 ```sh
-pip install joulescope          # only required for the direct fallback
+pip install pyjoulescope_driver        # only required for the direct fallback
 ```
 
-`joulescope` is **only** needed when the UI/plugin isn't running. If you only
-ever use the bridge backend, you can skip the pip install entirely — the
-client uses stdlib sockets for that path.
+`pyjoulescope_driver` is **only** needed when the UI/plugin isn't running. If
+you only ever use the bridge backend, you can skip the pip install entirely —
+the client uses stdlib sockets for that path. (On Homebrew Python you may
+need `pip install --break-system-packages` or `--user`.)
 
 ## Quickstart
 
@@ -77,8 +78,8 @@ Python, this is the contract. The client transparently uses two backends:
 - **Bridge backend** (preferred): talks to the UI plugin's localhost socket.
   Works while the human keeps the Joulescope UI open — no USB contention.
 - **Direct backend** (fallback): when the UI/plugin isn't running, the
-  client opens the JS220 itself via the `joulescope` package. Install it
-  with `pip install joulescope` — this is only needed if you expect to run
+  client opens the JS220 itself via `pyjoulescope_driver`. Install it with
+  `pip install pyjoulescope_driver` — only needed if you expect to run
   without the UI.
 
 The client tries the bridge first on every call, falls back to direct on
