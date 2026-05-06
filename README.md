@@ -50,16 +50,28 @@ OS and the full wire protocol.
 
 ## For AI agents / automation
 
-If you (an AI coding agent or a CI script) need to monitor a JS220 while a
-human keeps the Joulescope UI open, this is the contract.
+If you (an AI coding agent or a CI script) need to monitor a JS220 from
+Python, this is the contract. The client transparently uses two backends:
+
+- **Bridge backend** (preferred): talks to the UI plugin's localhost socket.
+  Works while the human keeps the Joulescope UI open — no USB contention.
+- **Direct backend** (fallback): when the UI/plugin isn't running, the
+  client opens the JS220 itself via the `joulescope` package
+  (`pip install joulescope`).
+
+The client tries the bridge first on every call, falls back to direct on
+`ConnectionRefusedError`, and **self-recovers**: a watcher thread polls the
+bridge every 2 s while direct is open, and closes the direct claim as soon
+as the UI comes back so the human's UI can attach to the device again.
 
 ### Preconditions
 
-- Joulescope UI is running with the **Agent Bridge** plugin enabled and the
-  Agent Bridge widget visible somewhere in the layout.
-- A JS220 is connected and streaming.
-- The widget shows `device: JS220-XXXXXX` and a non-zero event counter.
-- `127.0.0.1:9876` is reachable from your environment.
+- A JS220 is connected.
+- For the bridge backend: Joulescope UI is running with the **Agent Bridge**
+  plugin enabled and its widget visible. Widget shows `device: JS220-XXXXXX`
+  and a non-zero event counter.
+- For the direct backend: `pip install joulescope` available in the
+  current Python environment.
 
 ### Python API (preferred)
 
@@ -116,13 +128,18 @@ Full table of commands in [`plugin/README.md`](plugin/README.md).
   are connected, a human picks via the widget's combo box. The client always
   talks to whichever is currently attached — call `device()` first if you
   care which physical instrument you're driving.
-- **No USB claim.** The agent never opens the USB device; the UI does. Do
-  **not** call `joulescope.scan()` or `pyjoulescope_driver.open()` from the
-  same machine — those will fail and may confuse the running UI.
-- **Failure modes.** If the UI is closed, the plugin disabled, or the Agent
-  Bridge widget removed, the socket goes away and client calls raise
-  `ConnectionRefusedError`. Surface that to the human; don't auto-retry
-  indefinitely.
+- **USB claim is one or the other.** Bridge backend never touches USB
+  directly — the UI owns it. Direct backend owns USB itself, and while it's
+  open the UI cannot attach. The watcher handles the handoff: bring the UI
+  back up, and within ~2 s the client releases the device for the UI.
+  During that window, the UI may briefly show "no device" — that's normal.
+- **First direct-mode call is slow.** USB enumerate + waiting for the first
+  statistics sample adds up to ~1–3 s. Subsequent calls reuse the open
+  device and are fast.
+- **Failure modes.** Bridge unreachable AND no JS220 connected → client
+  raises `BridgeError("no JS220 found and Joulescope UI not running")`.
+  Bridge unreachable AND `joulescope` package missing → `BridgeError` with
+  a `pip install joulescope` hint.
 
 ### Recipe: measure quiescent current with the rail toggled
 
