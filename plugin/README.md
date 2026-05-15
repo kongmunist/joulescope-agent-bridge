@@ -47,11 +47,18 @@ Newline-delimited JSON, one request and one response per line, on
 | `{"cmd":"current"}` | `{"ok":true,"value":0.0123,"unit":"A"}` |
 | `{"cmd":"power"}` | `{"ok":true,"value":0.063,"unit":"W"}` |
 | `{"cmd":"stats_1s"}` | `{"ok":true,"n":2,"voltage":...,"current":...,"power":...}` |
+| `{"cmd":"accumulators"}` | `{"ok":true,"sample_time_s":...,"charge_c":...,"energy_j":...,"voltage":...,"current":...,"power":...}` |
 | `{"cmd":"power_set","on":true\|false}` | `{"ok":true,"target_power":true\|false}` |
 
 `stats_1s` averages the rolling 1 s window. The JS220's default UI statistics
 rate is 1–2 Hz, so expect `n` ≈ 1–2; raise it via the JS220's
 `statistics_frequency` setting if you need finer resolution.
+
+`accumulators` exposes Joulescope's cumulative charge and energy from the
+statistics stream. For long-running averages, take two snapshots and compute
+`delta_charge / elapsed` for average current and `delta_energy / elapsed` for
+average power. The elapsed value is the difference between the returned
+`sample_time_s` fields.
 
 A reference Python client lives at `agent_client.py` in the parent directory.
 

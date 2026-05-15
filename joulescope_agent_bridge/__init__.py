@@ -13,6 +13,7 @@ Public API (stable across both backends):
     read_current()      -> float, A
     read_power()        -> float, W
     avg_1s()            -> {"n": int, "voltage": ..., "current": ..., "power": ...}
+    read_accumulators() -> {"sample_time_s": ..., "charge_c": ..., "energy_j": ...}
     set_power(on: bool) -> bool
 
 `BridgeError` is raised for backend errors (no device, no samples yet, etc.).
@@ -37,6 +38,10 @@ __all__ = [
     "read_current",
     "read_power",
     "avg_1s",
+    "read_accumulators",
+    "read_stats_raw",
+    "accumulator_delta",
+    "benchmark_accumulators",
     "set_power",
     "__version__",
 ]
@@ -62,6 +67,28 @@ def _stats_mean(stats: dict, signal: str) -> float | None:
         except (KeyError, TypeError, ValueError):
             pass
     return None
+
+
+def _stats_accumulator(stats: dict, name: str) -> float | None:
+    try:
+        return float(stats["accumulators"][name]["value"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _first_present(*values: float | None) -> float | None:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _stats_sample_time(stats: dict, fallback: float) -> tuple[float, str]:
+    try:
+        t_range = stats["time"]["range"]["value"]
+        return float(t_range[1]), "stats.time.range.end"
+    except (KeyError, IndexError, TypeError, ValueError):
+        return fallback, "host.monotonic"
 
 
 # ---------- Bridge backend (UI plugin's socket) --------------------------
@@ -103,6 +130,10 @@ class _Direct:
         self._unique_id: str | None = None
         self._samples: collections.deque[tuple[float, float, float, float]] = collections.deque()
         self._last: tuple[float, float, float, float] | None = None
+        self._last_accumulators: tuple[float, float, float, float, float, float, int, str] | None = None
+        # (sample_time_s, charge_c, energy_j, v, i, p, event_count, sample_time_source)
+        self._last_stats: dict | None = None
+        self._event_count = 0
         self._closed = True  # gate on late callbacks
         self._stop = threading.Event()
         self._watcher: threading.Thread | None = None
@@ -149,6 +180,9 @@ class _Direct:
             self._unique_id = self._extract_uid(path)
             self._samples.clear()
             self._last = None
+            self._last_accumulators = None
+            self._last_stats = None
+            self._event_count = 0
             self._closed = False
         self._stop.clear()
         if self._watcher is None or not self._watcher.is_alive():
@@ -172,6 +206,9 @@ class _Direct:
             self._unique_id = None
             self._samples.clear()
             self._last = None
+            self._last_accumulators = None
+            self._last_stats = None
+            self._event_count = 0
         if d is None or path is None:
             return
         # Block on the unsubscribe so no late callbacks dispatch into our
@@ -201,17 +238,33 @@ class _Direct:
         # Defensive: callbacks can fire briefly after close() returns.
         if self._closed or not isinstance(value, dict):
             return
-        v = _stats_mean(value, "v") or _stats_mean(value, "voltage")
-        i = _stats_mean(value, "i") or _stats_mean(value, "current")
-        p = _stats_mean(value, "p") or _stats_mean(value, "power")
+        v = _first_present(_stats_mean(value, "v"), _stats_mean(value, "voltage"))
+        i = _first_present(_stats_mean(value, "i"), _stats_mean(value, "current"))
+        p = _first_present(_stats_mean(value, "p"), _stats_mean(value, "power"))
         if v is None or i is None or p is None:
             return
+        charge = _stats_accumulator(value, "charge")
+        energy = _stats_accumulator(value, "energy")
         now = time.monotonic()
+        sample_time_s, sample_time_source = _stats_sample_time(value, now)
         with self._lock:
             if self._closed:
                 return
             self._samples.append((now, v, i, p))
             self._last = (now, v, i, p)
+            self._last_stats = value
+            self._event_count += 1
+            if charge is not None and energy is not None:
+                self._last_accumulators = (
+                    sample_time_s,
+                    charge,
+                    energy,
+                    v,
+                    i,
+                    p,
+                    self._event_count,
+                    sample_time_source,
+                )
             cutoff = now - 1.0
             while self._samples and self._samples[0][0] < cutoff:
                 self._samples.popleft()
@@ -261,6 +314,33 @@ class _Direct:
                 "current": sum(s[2] for s in win) / n,
                 "power": sum(s[3] for s in win) / n,
             }
+        if cmd == "accumulators":
+            self.open()
+            self._wait_for_sample()
+            with self._lock:
+                accum = self._last_accumulators
+            if accum is None:
+                return {"ok": False, "error": "no accumulator samples yet"}
+            sample_time_s, charge_c, energy_j, v, i, p, event_count, sample_time_source = accum
+            return {
+                "ok": True,
+                "sample_time_s": sample_time_s,
+                "sample_time_source": sample_time_source,
+                "charge_c": charge_c,
+                "energy_j": energy_j,
+                "voltage": v,
+                "current": i,
+                "power": p,
+                "event_count": event_count,
+            }
+        if cmd == "stats_raw":
+            self.open()
+            self._wait_for_sample()
+            with self._lock:
+                stats = self._last_stats
+            if stats is None:
+                return {"ok": False, "error": "no samples yet"}
+            return {"ok": True, "stats": stats}
         if cmd == "power_set":
             self.open()
             on = bool(payload["on"])
@@ -295,6 +375,14 @@ def _request(payload: dict) -> dict:
         # Any other socket error: also fall back if direct is/was already in use.
         resp = _direct.request(payload)
     if not resp.get("ok"):
+        if (
+            payload.get("cmd") == "accumulators"
+            and "unknown cmd" in str(resp.get("error", ""))
+        ):
+            raise BridgeError(
+                "running bridge plugin does not support accumulators; "
+                "restart Joulescope UI or reload the Agent Bridge plugin"
+            )
         raise BridgeError(resp.get("error", "unknown error"))
     return resp
 
@@ -322,6 +410,87 @@ def avg_1s() -> dict[str, Any]:
     return {"n": r["n"], "voltage": r["voltage"], "current": r["current"], "power": r["power"]}
 
 
+def read_accumulators() -> dict[str, Any]:
+    r = _request({"cmd": "accumulators"})
+    return {
+        "sample_time_s": r["sample_time_s"],
+        "sample_time_source": r.get("sample_time_source"),
+        "charge_c": r["charge_c"],
+        "energy_j": r["energy_j"],
+        "voltage": r["voltage"],
+        "current": r["current"],
+        "power": r["power"],
+        "event_count": r.get("event_count"),
+    }
+
+
+def read_stats_raw() -> dict[str, Any]:
+    return _request({"cmd": "stats_raw"})["stats"]
+
+
+def accumulator_delta(start: dict[str, Any], end: dict[str, Any]) -> dict[str, float]:
+    elapsed_s = float(end["sample_time_s"]) - float(start["sample_time_s"])
+    if elapsed_s <= 0:
+        raise BridgeError(f"non-positive accumulator elapsed time: {elapsed_s}")
+    charge_c = float(end["charge_c"]) - float(start["charge_c"])
+    energy_j = float(end["energy_j"]) - float(start["energy_j"])
+    return {
+        "elapsed_s": elapsed_s,
+        "charge_c": charge_c,
+        "energy_j": energy_j,
+        "current": charge_c / elapsed_s,
+        "power": energy_j / elapsed_s,
+    }
+
+
+def benchmark_accumulators(duration_s: float = 60.0, poll_s: float = 1.0) -> dict[str, Any]:
+    if duration_s <= 0:
+        raise ValueError("duration_s must be > 0")
+    if poll_s <= 0:
+        raise ValueError("poll_s must be > 0")
+
+    start = read_accumulators()
+    deadline = time.monotonic() + duration_s
+    old_samples: list[dict[str, Any]] = []
+    while True:
+        old_samples.append(avg_1s())
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(poll_s, remaining))
+    end = read_accumulators()
+
+    old_n = len(old_samples)
+    old = {
+        "samples": old_n,
+        "bridge_n_total": sum(int(s["n"]) for s in old_samples),
+        "voltage": sum(float(s["voltage"]) for s in old_samples) / old_n,
+        "current": sum(float(s["current"]) for s in old_samples) / old_n,
+        "power": sum(float(s["power"]) for s in old_samples) / old_n,
+    }
+    accum = accumulator_delta(start, end)
+    return {
+        "duration_s": duration_s,
+        "poll_s": poll_s,
+        "old_avg_1s": old,
+        "accumulator": accum,
+        "start": start,
+        "end": end,
+        "diff": {
+            "current": old["current"] - accum["current"],
+            "power": old["power"] - accum["power"],
+            "current_pct": (
+                (old["current"] / accum["current"] - 1.0) * 100.0
+                if accum["current"] else float("nan")
+            ),
+            "power_pct": (
+                (old["power"] / accum["power"] - 1.0) * 100.0
+                if accum["power"] else float("nan")
+            ),
+        },
+    }
+
+
 def set_power(on: bool) -> bool:
     return _request({"cmd": "power_set", "on": bool(on)})["target_power"]
 
@@ -341,6 +510,13 @@ def _cli_main() -> int:
         print(f"avg I 1s : {avg['current']*1e3:.6f} mA")
         print(f"avg P 1s : {avg['power']*1e3:.6f} mW")
         print(f"samples  : {avg['n']}")
+        try:
+            accum = read_accumulators()
+        except BridgeError as e:
+            print(f"accum    : unavailable ({e})")
+        else:
+            print(f"charge   : {accum['charge_c']:.9g} C")
+            print(f"energy   : {accum['energy_j']:.9g} J")
         return 0
     cmd = sys.argv[1]
     if cmd == "on":
@@ -349,7 +525,37 @@ def _cli_main() -> int:
     if cmd == "off":
         print(set_power(False))
         return 0
-    print(f"usage: {sys.argv[0]} [on|off]", file=sys.stderr)
+    if cmd == "accum":
+        accum = read_accumulators()
+        print(json.dumps(accum, indent=2, sort_keys=True))
+        return 0
+    if cmd == "stats-raw":
+        stats = read_stats_raw()
+        print(json.dumps(stats, indent=2, sort_keys=True))
+        return 0
+    if cmd == "bench":
+        duration_s = float(sys.argv[2]) if len(sys.argv) >= 3 else 60.0
+        poll_s = float(sys.argv[3]) if len(sys.argv) >= 4 else 1.0
+        result = benchmark_accumulators(duration_s, poll_s)
+        old = result["old_avg_1s"]
+        accum = result["accumulator"]
+        diff = result["diff"]
+        print(f"duration       : {result['duration_s']:.3f} s")
+        print(f"accum elapsed  : {accum['elapsed_s']:.3f} s")
+        print(f"old samples    : {old['samples']} polls, {old['bridge_n_total']} bridge stats")
+        print(f"old avg current: {old['current'] * 1e6:.6f} uA")
+        print(f"accum current  : {accum['current'] * 1e6:.6f} uA")
+        print(f"diff current   : {diff['current'] * 1e6:.6f} uA ({diff['current_pct']:.3f}%)")
+        print(f"old avg power  : {old['power'] * 1e6:.6f} uW")
+        print(f"accum power    : {accum['power'] * 1e6:.6f} uW")
+        print(f"diff power     : {diff['power'] * 1e6:.6f} uW ({diff['power_pct']:.3f}%)")
+        print(f"charge delta   : {accum['charge_c']:.9g} C")
+        print(f"energy delta   : {accum['energy_j']:.9g} J")
+        return 0
+    print(
+        f"usage: {sys.argv[0]} [on|off|accum|stats-raw|bench [duration_s] [poll_s]]",
+        file=sys.stderr,
+    )
     return 2
 
 
@@ -357,7 +563,11 @@ def main() -> None:
     """Console-script entry point: runs the CLI and exits cleanly."""
     import os
     import sys
-    rc = _cli_main()
+    try:
+        rc = _cli_main()
+    except BridgeError as e:
+        print(f"error: {e}", file=sys.stderr)
+        rc = 1
     sys.stdout.flush()
     sys.stderr.flush()
     # Explicit close before interpreter teardown — the C jsdrv thread can

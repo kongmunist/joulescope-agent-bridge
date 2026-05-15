@@ -12,6 +12,7 @@ Wire protocol (one JSON object per line, request and response):
     {"cmd": "current"}               -> {"ok": true, "value": 0.0123, "unit": "A"}
     {"cmd": "power"}                 -> {"ok": true, "value": 0.063, "unit": "W"}
     {"cmd": "stats_1s"}              -> {"ok": true, "n": 2, "voltage": ..., "current": ..., "power": ...}
+    {"cmd": "accumulators"}          -> {"ok": true, "charge_c": ..., "energy_j": ..., "sample_time_s": ...}
     {"cmd": "power_set", "on": true} -> {"ok": true, "target_power": true}
 
 Note: target_power is published on the device's settings topic, which cuts
@@ -68,6 +69,28 @@ def _extract_mean(stats: dict, signal: str) -> Optional[float]:
     return None
 
 
+def _extract_accumulator(stats: dict, name: str) -> Optional[float]:
+    try:
+        return float(stats["accumulators"][name]["value"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _first_present(*values: Optional[float]) -> Optional[float]:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _extract_sample_time(stats: dict, fallback: float) -> tuple[float, str]:
+    try:
+        t_range = stats["time"]["range"]["value"]
+        return float(t_range[1]), "stats.time.range.end"
+    except (KeyError, IndexError, TypeError, ValueError):
+        return fallback, "host.monotonic"
+
+
 class _Bridge:
     """Holds the rolling buffer and the device topic prefix."""
 
@@ -77,6 +100,9 @@ class _Bridge:
         self.unique_id: Optional[str] = None
         self.samples: collections.deque[tuple[float, float, float, float]] = collections.deque()
         self.last: Optional[tuple[float, float, float, float]] = None  # (t, v, i, p)
+        self.last_accumulators: Optional[tuple[float, float, float, float, float, float, int, str]] = None
+        # (sample_time_s, charge_c, energy_j, v, i, p, event_count, sample_time_source)
+        self.last_stats: Optional[dict] = None
         self.event_count: int = 0
 
     def attach(self, unique_id: str) -> None:
@@ -86,6 +112,8 @@ class _Bridge:
             self.device_prefix = prefix
             self.samples.clear()
             self.last = None
+            self.last_accumulators = None
+            self.last_stats = None
             self.event_count = 0
         try:
             pubsub_singleton.subscribe(f"{prefix}/{_STATS_SUBTOPIC}", self._on_stats, ["pub"])
@@ -95,16 +123,31 @@ class _Bridge:
     def _on_stats(self, topic: str, value: Any) -> None:
         if not isinstance(value, dict):
             return
-        v = _extract_mean(value, "v") or _extract_mean(value, "voltage")
-        i = _extract_mean(value, "i") or _extract_mean(value, "current")
-        p = _extract_mean(value, "p") or _extract_mean(value, "power")
+        v = _first_present(_extract_mean(value, "v"), _extract_mean(value, "voltage"))
+        i = _first_present(_extract_mean(value, "i"), _extract_mean(value, "current"))
+        p = _first_present(_extract_mean(value, "p"), _extract_mean(value, "power"))
         if v is None or i is None or p is None:
             return
+        charge = _extract_accumulator(value, "charge")
+        energy = _extract_accumulator(value, "energy")
         now = time.monotonic()
+        sample_time_s, sample_time_source = _extract_sample_time(value, now)
         with self.lock:
             self.samples.append((now, v, i, p))
             self.last = (now, v, i, p)
+            self.last_stats = value
             self.event_count += 1
+            if charge is not None and energy is not None:
+                self.last_accumulators = (
+                    sample_time_s,
+                    charge,
+                    energy,
+                    v,
+                    i,
+                    p,
+                    self.event_count,
+                    sample_time_source,
+                )
             cutoff = now - WINDOW_S
             while self.samples and self.samples[0][0] < cutoff:
                 self.samples.popleft()
@@ -116,6 +159,14 @@ class _Bridge:
     def window(self) -> list[tuple[float, float, float, float]]:
         with self.lock:
             return list(self.samples)
+
+    def accumulators(self) -> Optional[tuple[float, float, float, float, float, float, int, str]]:
+        with self.lock:
+            return self.last_accumulators
+
+    def stats_raw(self) -> Optional[dict]:
+        with self.lock:
+            return self.last_stats
 
     def set_power(self, on: bool) -> bool:
         if self.device_prefix is None:
@@ -154,6 +205,27 @@ def _handle_request(req: dict) -> dict:
             "current": sum(s[2] for s in win) / n,
             "power": sum(s[3] for s in win) / n,
         }
+    if cmd == "accumulators":
+        accum = _bridge.accumulators()
+        if accum is None:
+            return {"ok": False, "error": "no accumulator samples yet"}
+        sample_time_s, charge_c, energy_j, v, i, p, event_count, sample_time_source = accum
+        return {
+            "ok": True,
+            "sample_time_s": sample_time_s,
+            "sample_time_source": sample_time_source,
+            "charge_c": charge_c,
+            "energy_j": energy_j,
+            "voltage": v,
+            "current": i,
+            "power": p,
+            "event_count": event_count,
+        }
+    if cmd == "stats_raw":
+        stats = _bridge.stats_raw()
+        if stats is None:
+            return {"ok": False, "error": "no samples yet"}
+        return {"ok": True, "stats": stats}
     if cmd == "power_set":
         try:
             value = _bridge.set_power(bool(req["on"]))

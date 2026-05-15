@@ -113,7 +113,8 @@ as the UI comes back so the human's UI can attach to the device again.
 
 ```python
 from joulescope_agent_bridge import (
-    device, read_voltage, read_current, read_power, avg_1s, set_power,
+    device, read_voltage, read_current, read_power, avg_1s,
+    read_accumulators, accumulator_delta, set_power,
     BridgeError,
 )
 
@@ -122,6 +123,8 @@ read_voltage()     # -> 3.7991  (volts)
 read_current()     # -> 1.7e-06 (amps; signed, source-positive)
 read_power()       # -> 6.4e-06 (watts)
 avg_1s()           # -> {"n": 2, "voltage": 3.7991, "current": 1.6e-06, "power": 6.2e-06}
+read_accumulators()
+# -> {"sample_time_s": ..., "charge_c": ..., "energy_j": ..., "voltage": ..., "current": ..., "power": ...}
 set_power(False)   # cut the DUT rail; returns False
 set_power(True)    # restore the rail; returns True
 ```
@@ -141,6 +144,9 @@ One JSON object per line, request and response, on `127.0.0.1:9876`:
 
 -> {"cmd":"power_set","on":false}
 <- {"ok":true,"target_power":false}
+
+-> {"cmd":"accumulators"}
+<- {"ok":true,"charge_c":0.00123,"energy_j":0.00492,"sample_time_s":12345.6,...}
 ```
 
 Full table of commands in [`plugin/README.md`](plugin/README.md).
@@ -155,6 +161,11 @@ Full table of commands in [`plugin/README.md`](plugin/README.md).
 - **`avg_1s().n`.** At 1 Hz statistics this returns `n = 1` and is therefore
   not a meaningful average. Raise `statistics_frequency` to 2–10 Hz in the
   UI before relying on `avg_1s`.
+- **Long-running averages.** Prefer `read_accumulators()` snapshots over
+  repeated `avg_1s()` polling. Joulescope publishes cumulative charge and
+  energy; take two snapshots and compute `delta_charge / elapsed` for average
+  current and `delta_energy / elapsed` for average power. If the UI's
+  accumulators are cleared during a run, discard that run.
 - **Toolbar power button cosmetic.** `set_power` cuts/restores the rail
   (verifiable via `read_voltage` ≈ 0 V) but does not visually flip the UI's
   top-left toolbar power button. The button writes to a separate app-level
@@ -194,6 +205,15 @@ off = avg_1s()
 set_power(True)               # always restore
 print("delta_I =", on["current"] - off["current"], "A")
 ```
+
+### Recipe: compare 1 s polling against accumulators
+
+```sh
+joulescope-bridge bench 60 1
+```
+
+This samples the old `avg_1s()` path once per second for 60 seconds and
+compares it against the Joulescope accumulator delta over the same interval.
 
 ## License
 

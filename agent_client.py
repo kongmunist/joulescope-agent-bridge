@@ -6,9 +6,12 @@ and `python agent_client.py` still runs the CLI.
 
 from joulescope_agent_bridge import (  # noqa: F401
     BridgeError,
+    accumulator_delta,
     avg_1s,
+    benchmark_accumulators,
     device,
     main,
+    read_accumulators,
     read_current,
     read_power,
     read_voltage,
