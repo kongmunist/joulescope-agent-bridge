@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import collections
 import json
+import logging
 import socket
 import socketserver
 import threading
@@ -44,6 +45,7 @@ BIND_HOST = "127.0.0.1"
 BIND_PORT = 9876
 WINDOW_S = 1.0
 DEVICE_PREFIX_MATCH = "JS220-"
+_LOG = logging.getLogger(__name__)
 
 # Subtopics relative to a device's registry root (registry/<unique_id>/...).
 _STATS_SUBTOPIC = "events/statistics/!data"
@@ -333,6 +335,37 @@ def _discover_devices() -> list[str]:
     return sorted(found)
 
 
+_backend_started = False
+
+
+def _activate_backend() -> None:
+    """Start the socket backend when the plugin is loaded.
+
+    Older versions required the status widget to be visible before the socket
+    was bound. That made headless/SSH automation depend on a saved UI layout.
+    """
+    global _backend_started
+    if _backend_started:
+        return
+    _backend_started = True
+
+    for cap in _CAPABILITY_TOPICS:
+        try:
+            pubsub_singleton.subscribe(cap, _on_capability_list, ["pub", "retain"])
+        except Exception:
+            _LOG.exception("failed to subscribe to %s", cap)
+
+    for uid in _discover_devices():
+        if _bridge.device_prefix is None:
+            _bridge.attach(uid)
+            break
+
+    try:
+        _start_server()
+    except OSError:
+        _LOG.exception("failed to bind Agent Bridge on %s:%s", BIND_HOST, BIND_PORT)
+
+
 @register
 @styled_widget(N_("Agent Bridge"))
 class AgentBridgeWidget(QtWidgets.QWidget):
@@ -411,5 +444,7 @@ class AgentBridgeWidget(QtWidgets.QWidget):
         self._label.setText("\n".join(lines))
 
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt naming)
-        _stop_server()
         super().closeEvent(event)
+
+
+_activate_backend()

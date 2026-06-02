@@ -46,8 +46,10 @@ New-Item -ItemType SymbolicLink `
   -Value "$PWD\plugin"
 ```
 
-Then restart the Joulescope UI, **File → Plugins** → enable **Agent Bridge**,
-and drop the **Agent Bridge** widget into your layout.
+Then restart the Joulescope UI and enable **Agent Bridge** in
+**File → Plugins**. Loading the plugin starts the localhost bridge backend.
+The optional **Agent Bridge** widget shows status and lets you manually pick a
+device when multiple JS220s are connected.
 
 ### Client (Python)
 
@@ -104,8 +106,8 @@ as the UI comes back so the human's UI can attach to the device again.
 
 - A JS220 is connected.
 - For the bridge backend: Joulescope UI is running with the **Agent Bridge**
-  plugin enabled and its widget visible. Widget shows `device: JS220-XXXXXX`
-  and a non-zero event counter.
+  plugin enabled. Verify with `lsof -nP -iTCP:9876 -sTCP:LISTEN`. The optional
+  widget shows `device: JS220-XXXXXX` and a non-zero event counter.
 - For the direct backend: `pip install joulescope` available in the
   current Python environment.
 
