@@ -103,6 +103,7 @@ class _Bridge:
         self.samples: collections.deque[tuple[float, float, float, float]] = collections.deque()
         self.last: Optional[tuple[float, float, float, float]] = None  # (t, v, i, p)
         self.last_accumulators: Optional[tuple[float, float, float, float, float, float, int, str]] = None
+        self.last_accumulators_at: Optional[float] = None
         # (sample_time_s, charge_c, energy_j, v, i, p, event_count, sample_time_source)
         self.last_stats: Optional[dict] = None
         self.event_count: int = 0
@@ -115,6 +116,7 @@ class _Bridge:
             self.samples.clear()
             self.last = None
             self.last_accumulators = None
+            self.last_accumulators_at = None
             self.last_stats = None
             self.event_count = 0
         try:
@@ -132,9 +134,9 @@ class _Bridge:
             return
         charge = _extract_accumulator(value, "charge")
         energy = _extract_accumulator(value, "energy")
-        now = time.monotonic()
-        sample_time_s, sample_time_source = _extract_sample_time(value, now)
         with self.lock:
+            now = time.monotonic()
+            sample_time_s, sample_time_source = _extract_sample_time(value, now)
             self.samples.append((now, v, i, p))
             self.last = (now, v, i, p)
             self.last_stats = value
@@ -150,25 +152,39 @@ class _Bridge:
                     self.event_count,
                     sample_time_source,
                 )
-            cutoff = now - WINDOW_S
-            while self.samples and self.samples[0][0] < cutoff:
-                self.samples.popleft()
+                self.last_accumulators_at = now
+            self._trim(now)
 
-    def snapshot(self) -> Optional[tuple[float, float, float, float]]:
-        with self.lock:
-            return self.last
+    def _trim(self, now: float) -> None:
+        # Called with the lock held, so a callback cannot reorder samples.
+        cutoff = now - WINDOW_S
+        while self.samples and self.samples[0][0] < cutoff:
+            self.samples.popleft()
 
-    def window(self) -> list[tuple[float, float, float, float]]:
+    def snapshot(self) -> tuple[Optional[tuple[float, float, float, float]], Optional[float]]:
         with self.lock:
-            return list(self.samples)
+            now = time.monotonic()
+            self._trim(now)
+            return self.last, None if self.last is None else now - self.last[0]
 
-    def accumulators(self) -> Optional[tuple[float, float, float, float, float, float, int, str]]:
+    def window(self) -> tuple[list[tuple[float, float, float, float]], Optional[float]]:
         with self.lock:
-            return self.last_accumulators
+            now = time.monotonic()
+            self._trim(now)
+            return list(self.samples), None if self.last is None else now - self.last[0]
 
-    def stats_raw(self) -> Optional[dict]:
+    def accumulators(self) -> tuple[Optional[tuple[float, float, float, float, float, float, int, str]], Optional[float]]:
         with self.lock:
-            return self.last_stats
+            now = time.monotonic()
+            self._trim(now)
+            age = None if self.last_accumulators_at is None else now - self.last_accumulators_at
+            return self.last_accumulators, age
+
+    def stats_raw(self) -> tuple[Optional[dict], Optional[float]]:
+        with self.lock:
+            now = time.monotonic()
+            self._trim(now)
+            return self.last_stats, None if self.last is None else now - self.last[0]
 
     def set_power(self, on: bool) -> bool:
         if self.device_prefix is None:
@@ -186,34 +202,40 @@ def _handle_request(req: dict) -> dict:
     if cmd == "device":
         return {"ok": True, "unique_id": _bridge.unique_id}
     if cmd in ("voltage", "current", "power"):
-        snap = _bridge.snapshot()
+        snap, age = _bridge.snapshot()
         if snap is None:
             return {"ok": False, "error": "no samples yet"}
+        if age > WINDOW_S:
+            return {"ok": False, "error": "no fresh samples", "age_s": age}
         _, v, i, p = snap
         if cmd == "voltage":
-            return {"ok": True, "value": v, "unit": "V"}
+            return {"ok": True, "value": v, "unit": "V", "age_s": age}
         if cmd == "current":
-            return {"ok": True, "value": i, "unit": "A"}
-        return {"ok": True, "value": p, "unit": "W"}
+            return {"ok": True, "value": i, "unit": "A", "age_s": age}
+        return {"ok": True, "value": p, "unit": "W", "age_s": age}
     if cmd == "stats_1s":
-        win = _bridge.window()
+        win, age = _bridge.window()
         if not win:
-            return {"ok": False, "error": "no samples yet"}
+            if age is None:
+                return {"ok": False, "error": "no samples yet"}
+            return {"ok": False, "error": "no fresh samples", "age_s": age}
         n = len(win)
         return {
             "ok": True,
             "n": n,
+            "age_s": age,
             "voltage": sum(s[1] for s in win) / n,
             "current": sum(s[2] for s in win) / n,
             "power": sum(s[3] for s in win) / n,
         }
     if cmd == "accumulators":
-        accum = _bridge.accumulators()
+        accum, age = _bridge.accumulators()
         if accum is None:
             return {"ok": False, "error": "no accumulator samples yet"}
         sample_time_s, charge_c, energy_j, v, i, p, event_count, sample_time_source = accum
         return {
             "ok": True,
+            "age_s": age,
             "sample_time_s": sample_time_s,
             "sample_time_source": sample_time_source,
             "charge_c": charge_c,
@@ -224,10 +246,10 @@ def _handle_request(req: dict) -> dict:
             "event_count": event_count,
         }
     if cmd == "stats_raw":
-        stats = _bridge.stats_raw()
+        stats, age = _bridge.stats_raw()
         if stats is None:
             return {"ok": False, "error": "no samples yet"}
-        return {"ok": True, "stats": stats}
+        return {"ok": True, "stats": stats, "age_s": age}
     if cmd == "power_set":
         try:
             value = _bridge.set_power(bool(req["on"]))
