@@ -54,11 +54,23 @@ Newline-delimited JSON, one request and one response per line, on
 rate is 1–2 Hz, so expect `n` ≈ 1–2; raise it via the JS220's
 `statistics_frequency` setting if you need finer resolution.
 
+Measurement responses include `age_s`, the number of seconds since the host
+received the relevant statistics event, measured with a monotonic clock.
+`stats_1s`, `voltage`, `current`, and `power` return `ok:false` with
+`error:"no fresh samples"` and `age_s` if the newest event is older than
+1 second. Before the first event, they return `error:"no samples yet"`.
+An event exactly 1 second old is still in the window. These ages measure host
+receipt, not the age of data inside the device or UI.
+
 `accumulators` exposes Joulescope's cumulative charge and energy from the
 statistics stream. For long-running averages, take two snapshots and compute
 `delta_charge / elapsed` for average current and `delta_energy / elapsed` for
 average power. The elapsed value is the difference between the returned
 `sample_time_s` fields.
+`accumulators` and `stats_raw` still return their most recent available data
+even when it is old. Their `age_s` fields allow clients to check freshness.
+The accumulator age is for the last event that contained both charge and
+energy; it can differ from the age of `stats_raw`.
 
 A reference Python client lives at `agent_client.py` in the parent directory.
 
